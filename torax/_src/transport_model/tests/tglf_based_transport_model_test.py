@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pydantic
 from torax._src import array_typing
+from torax._src import constants
 from torax._src.config import runtime_params as runtime_params_lib
 from torax._src.core_profiles import core_profiles as core_profiles_lib
 from torax._src.fvm import cell_variable
@@ -276,6 +277,108 @@ class TGLFTransportModelTest(parameterized.TestCase):
             core_transport_false.total.d_face_el,
         )
     )
+
+  @parameterized.named_parameters(
+      dict(testcase_name="scaled_d", dv_effective=False),
+      dict(testcase_name="dv_effective", dv_effective=True),
+  )
+  def test_make_transport_coeffs_conserves_fluxes_in_shaped_geometry(
+      self, dv_effective: bool
+  ):
+    config_dict = default_configs.get_default_config_dict()
+    config_dict["geometry"] = {
+        "model_name": "chease",
+        "geometry_file": "iterhybrid.mat2cols",
+    }
+    config_dict["transport"] = {
+        "core_transport_models": {
+            "tglf_based": {
+                "model_name": "tglf_based",
+                "DV_effective": dv_effective,
+            },
+        },
+    }
+    torax_config = config.ToraxConfig.from_dict(config_dict)
+    core_profiles, runtime_params, geo = (
+        core_profile_helpers.make_initial_inputs(torax_config)
+    )
+    two_point_mask = np.zeros_like(geo.rho_face_norm, dtype=bool)
+    transport_model = (
+        torax_config.transport.build_transport_model().core_transport_models[
+            "tglf_based"
+        ]
+    )
+    assert isinstance(
+        transport_model, tglf_based_transport_model.TGLFBasedTransportModel
+    )
+    tglf_params = runtime_params.transport.core_transport_model_params[
+        "tglf_based"
+    ]
+    assert isinstance(tglf_params, tglf_based_transport_model.RuntimeParams)
+    tglf_inputs = transport_model._prepare_tglf_inputs(
+        transport=tglf_params,
+        geo=geo,
+        core_profiles=core_profiles,
+        two_point_mask=two_point_mask,
+    )
+
+    q_e_gb = jnp.full_like(geo.rho_face_norm, 0.5)
+    q_i_gb = jnp.full_like(geo.rho_face_norm, 0.4)
+    gamma_e_gb = jnp.full_like(geo.rho_face_norm, 1.6)
+    coeffs = transport_model._make_transport_coeffs(
+        electron_heat_flux_GB=q_e_gb,
+        ion_heat_flux_GB=q_i_gb,
+        electron_particle_flux_GB=gamma_e_gb,
+        tglf_inputs=tglf_inputs,
+        transport=tglf_params,
+        geo=geo,
+        core_profiles=core_profiles,
+        two_point_mask=two_point_mask,
+    )
+
+    drho_dr = jnp.gradient(geo.rho_face, geo.r_mid_face)
+    # Precondition: shaped CHEASE geometry has dρ/dr appreciably != 1.
+    self.assertFalse(np.allclose(drho_dr[1:], 1.0, rtol=0.05))
+
+    dv_dr = (geo.vpr_face / geo.rho_b) * drho_dr
+    p_e_expected = q_e_gb * tglf_inputs.Q_GB * dv_dr
+    p_i_expected = q_i_gb * tglf_inputs.Q_GB * dv_dr
+    phi_n_expected = gamma_e_gb * tglf_inputs.GAMMA_GB * dv_dr
+
+    dt_e_drhon = (
+        core_profiles.kinetic.T_e.face_grad(two_point_mask=two_point_mask)
+        * constants.CONSTANTS.keV_to_J
+    )
+    dt_i_drhon = (
+        core_profiles.kinetic.T_i.face_grad(two_point_mask=two_point_mask)
+        * constants.CONSTANTS.keV_to_J
+    )
+    dn_e_drhon = core_profiles.kinetic.n_e.face_grad(
+        two_point_mask=two_point_mask
+    )
+
+    p_e_torax = (
+        -coeffs.chi_face_el
+        * core_profiles.kinetic.n_e.face_value()
+        * dt_e_drhon
+        * geo.g1_over_vpr_face
+    )
+    p_i_torax = (
+        -coeffs.chi_face_ion
+        * core_profiles.kinetic.n_i.face_value()
+        * dt_i_drhon
+        * geo.g1_over_vpr_face
+    )
+    phi_n_torax = (
+        -coeffs.d_face_el * dn_e_drhon * geo.g1_over_vpr_face
+        + coeffs.v_face_el
+        * core_profiles.kinetic.n_e.face_value()
+        * geo.g0_face
+    )
+
+    np.testing.assert_allclose(p_e_torax[1:], p_e_expected[1:], rtol=1e-6)
+    np.testing.assert_allclose(p_i_torax[1:], p_i_expected[1:], rtol=1e-6)
+    np.testing.assert_allclose(phi_n_torax[1:], phi_n_expected[1:], rtol=1e-6)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
